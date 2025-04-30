@@ -1,11 +1,10 @@
-// socket.js
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
 
 module.exports = (server, pool) => {
   const io = new Server(server, {
     cors: {
-      origin: "*"
+      origin: '*'
     }
   });
 
@@ -44,8 +43,7 @@ module.exports = (server, pool) => {
       const game = games.get(gameId);
       if (!game || game.winner || game.board[x][y]) return;
 
-      const currentPlayer = game.turn;
-      if (currentPlayer !== userId) return;
+      if (game.turn !== userId) return;
 
       game.board[x][y] = userId;
       game.moves.push({ x, y, userId });
@@ -53,8 +51,7 @@ module.exports = (server, pool) => {
 
       io.to(gameId).emit('movePlayed', { x, y, userId });
 
-      const winner = checkWinner(game.board, x, y, userId);
-      if (winner) {
+      if (checkWinner(game.board, x, y, userId)) {
         game.winner = userId;
         saveResult(pool, game);
         io.to(gameId).emit('gameOver', { winner: userId });
@@ -78,9 +75,7 @@ module.exports = (server, pool) => {
   });
 
   const checkWinner = (board, x, y, playerId) => {
-    const directions = [
-      [1, 0], [0, 1], [1, 1], [1, -1]
-    ];
+    const directions = [[1, 0], [0, 1], [1, 1], [1, -1]];
     for (let [dx, dy] of directions) {
       let count = 1;
       for (let dir of [-1, 1]) {
@@ -88,7 +83,7 @@ module.exports = (server, pool) => {
         while (true) {
           nx += dx * dir;
           ny += dy * dir;
-          if (board[nx] && board[nx][ny] === playerId) {
+          if (board[nx]?.[ny] === playerId) {
             count++;
           } else {
             break;
@@ -103,19 +98,21 @@ module.exports = (server, pool) => {
   const saveResult = async (pool, game) => {
     try {
       await pool.query(
-        'INSERT INTO games (id, player_x, player_o, winner, moves, abandoned, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())',
+        `INSERT INTO games (id, player1, player2, winner, moves, abandoned, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (id) DO NOTHING`,
         [
           game.id,
-          game.players[0],
-          game.players[1],
+          game.players[0] || null,
+          game.players[1] || null,
           game.winner,
           JSON.stringify(game.moves),
           game.abandoned
         ]
       );
-      console.log('Résultat enregistré.');
+      console.log('✅ Résultat enregistré en base de données.');
     } catch (err) {
-      console.error('Erreur lors de l’enregistrement en BDD :', err.message);
+      console.error('❌ Erreur enregistrement en BDD :', err.message);
     }
   };
 };
