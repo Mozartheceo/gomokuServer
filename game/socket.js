@@ -3,10 +3,12 @@ const { v4: uuidv4 } = require('uuid');
 
 module.exports = (server, pool) => {
   const io = new Server(server, {
-    cors: {
-      origin: '*'
-    }
-  });
+  cors: {
+    origin: "http://localhost:3000", // autorise ton client local
+    methods: ["GET", "POST"]
+  }
+});
+
 
   const games = new Map();
 
