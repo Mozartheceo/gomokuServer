@@ -1,62 +1,81 @@
-// socket.js - Gère les sockets pour Gomoku avec enregistrement dans PostgreSQL
+// socket.js
 const { Server } = require('socket.io');
+const GomokuGame = require('./engine'); // On importe la logique du jeu
 
-function setupSocket(server, pool) {
+const activeGames = new Map(); // { roomId: { game: GomokuGame, players: [socket1, socket2], lastMoveAt: Date } }
+
+module.exports = function (server, pool) {
   const io = new Server(server, {
     cors: {
       origin: '*',
-    },
+    }
   });
-
-  const games = {}; // mémorise l'état des parties en mémoire
 
   io.on('connection', (socket) => {
-    console.log(`✅ Nouveau client connecté : ${socket.id}`);
+    console.log(`Utilisateur connecté : ${socket.id}`);
 
-    socket.on('joinGame', ({ gameId, player }) => {
-      socket.join(gameId);
-      if (!games[gameId]) {
-        games[gameId] = {
-          moves: [],
-          players: {},
-          currentTurn: 'x',
-        };
-      }
-      games[gameId].players[player] = socket.id;
-      io.to(gameId).emit('gameUpdate', games[gameId]);
-    });
+    socket.on('joinGame', (roomId) => {
+      socket.join(roomId);
+      console.log(`Socket ${socket.id} rejoint la salle ${roomId}`);
 
-    socket.on('playMove', ({ gameId, x, y, player }) => {
-      const game = games[gameId];
-      if (!game || game.currentTurn !== player) return;
-
-      game.moves.push({ x, y, player });
-      game.currentTurn = player === 'x' ? 'o' : 'x';
-      io.to(gameId).emit('movePlayed', { x, y, player });
-    });
-
-    socket.on('endGame', async ({ gameId, winner }) => {
-      const game = games[gameId];
-      if (!game) return;
-
-      const player_x = Object.keys(game.players)[0] || 'unknown';
-      const player_o = Object.keys(game.players)[1] || 'unknown';
-      const moves = game.moves;
-
-      try {
-        await pool.query(
-          'INSERT INTO games (player_x, player_o, winner, moves) VALUES ($1, $2, $3, $4)',
-          [player_x, player_o, winner, JSON.stringify(moves)]
-        );
-        console.log(`✅ Partie ${gameId} enregistrée en base de données.`);
-      } catch (err) {
-        console.error('❌ Erreur lors de l’enregistrement en base :', err);
+      if (!activeGames.has(roomId)) {
+        activeGames.set(roomId, {
+          game: new GomokuGame(),
+          players: [],
+          lastMoveAt: new Date()
+        });
       }
 
-      delete games[gameId];
-      io.to(gameId).emit('gameEnded', { winner });
+      const gameData = activeGames.get(roomId);
+      if (gameData.players.length < 2) {
+        gameData.players.push(socket);
+        socket.emit('playerSymbol', gameData.players.length === 1 ? 'X' : 'O');
+      }
+
+      io.to(roomId).emit('updateBoard', {
+        board: gameData.game.getBoard(),
+        currentPlayer: gameData.game.getCurrentPlayer(),
+        winner: gameData.game.getWinner()
+      });
+    });
+
+    socket.on('playMove', ({ roomId, row, col }) => {
+      const gameData = activeGames.get(roomId);
+      if (!gameData || gameData.game.getWinner()) return;
+
+      const game = gameData.game;
+      const moved = game.makeMove(row, col);
+      gameData.lastMoveAt = new Date();
+
+      if (moved) {
+        const winner = game.getWinner();
+        io.to(roomId).emit('updateBoard', {
+          board: game.getBoard(),
+          currentPlayer: game.getCurrentPlayer(),
+          winner: winner
+        });
+
+        // Sauvegarde en DB si partie terminée
+        if (winner) {
+          pool.query(
+            'INSERT INTO matches (room_id, winner, played_at) VALUES ($1, $2, NOW())',
+            [roomId, winner === 'draw' ? null : winner],
+            (err) => {
+              if (err) console.error('Erreur DB:', err);
+            }
+          );
+        }
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log(`Utilisateur déconnecté : ${socket.id}`);
+      for (const [roomId, data] of activeGames.entries()) {
+        data.players = data.players.filter(p => p.id !== socket.id);
+        if (data.players.length === 0) {
+          activeGames.delete(roomId); // on supprime la salle vide
+        }
+      }
     });
   });
-}
-
-module.exports = setupSocket;
+};
