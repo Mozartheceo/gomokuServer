@@ -1,81 +1,121 @@
 // socket.js
 const { Server } = require('socket.io');
-const GomokuGame = require('./engine'); // On importe la logique du jeu
+const { v4: uuidv4 } = require('uuid');
 
-const activeGames = new Map(); // { roomId: { game: GomokuGame, players: [socket1, socket2], lastMoveAt: Date } }
-
-module.exports = function (server, pool) {
+module.exports = (server, pool) => {
   const io = new Server(server, {
     cors: {
-      origin: '*',
+      origin: "*"
     }
   });
 
+  const games = new Map();
+
   io.on('connection', (socket) => {
-    console.log(`Utilisateur connecté : ${socket.id}`);
+    console.log(`Nouvelle connexion : ${socket.id}`);
 
-    socket.on('joinGame', (roomId) => {
-      socket.join(roomId);
-      console.log(`Socket ${socket.id} rejoint la salle ${roomId}`);
-
-      if (!activeGames.has(roomId)) {
-        activeGames.set(roomId, {
-          game: new GomokuGame(),
-          players: [],
-          lastMoveAt: new Date()
-        });
-      }
-
-      const gameData = activeGames.get(roomId);
-      if (gameData.players.length < 2) {
-        gameData.players.push(socket);
-        socket.emit('playerSymbol', gameData.players.length === 1 ? 'X' : 'O');
-      }
-
-      io.to(roomId).emit('updateBoard', {
-        board: gameData.game.getBoard(),
-        currentPlayer: gameData.game.getCurrentPlayer(),
-        winner: gameData.game.getWinner()
+    socket.on('createGame', ({ userId }) => {
+      const gameId = uuidv4();
+      games.set(gameId, {
+        id: gameId,
+        players: [userId],
+        board: Array(15).fill(null).map(() => Array(15).fill(null)),
+        turn: userId,
+        moves: [],
+        winner: null,
+        abandoned: false
       });
+      socket.join(gameId);
+      socket.emit('gameCreated', { gameId });
     });
 
-    socket.on('playMove', ({ roomId, row, col }) => {
-      const gameData = activeGames.get(roomId);
-      if (!gameData || gameData.game.getWinner()) return;
+    socket.on('joinGame', ({ gameId, userId }) => {
+      const game = games.get(gameId);
+      if (game && game.players.length === 1) {
+        game.players.push(userId);
+        socket.join(gameId);
+        io.to(gameId).emit('startGame', { gameId, players: game.players });
+      } else {
+        socket.emit('error', { message: 'Impossible de rejoindre cette partie.' });
+      }
+    });
 
-      const game = gameData.game;
-      const moved = game.makeMove(row, col);
-      gameData.lastMoveAt = new Date();
+    socket.on('playMove', ({ gameId, userId, x, y }) => {
+      const game = games.get(gameId);
+      if (!game || game.winner || game.board[x][y]) return;
 
-      if (moved) {
-        const winner = game.getWinner();
-        io.to(roomId).emit('updateBoard', {
-          board: game.getBoard(),
-          currentPlayer: game.getCurrentPlayer(),
-          winner: winner
-        });
+      const currentPlayer = game.turn;
+      if (currentPlayer !== userId) return;
 
-        // Sauvegarde en DB si partie terminée
-        if (winner) {
-          pool.query(
-            'INSERT INTO matches (room_id, winner, played_at) VALUES ($1, $2, NOW())',
-            [roomId, winner === 'draw' ? null : winner],
-            (err) => {
-              if (err) console.error('Erreur DB:', err);
-            }
-          );
-        }
+      game.board[x][y] = userId;
+      game.moves.push({ x, y, userId });
+      game.turn = game.players.find(p => p !== userId);
+
+      io.to(gameId).emit('movePlayed', { x, y, userId });
+
+      const winner = checkWinner(game.board, x, y, userId);
+      if (winner) {
+        game.winner = userId;
+        saveResult(pool, game);
+        io.to(gameId).emit('gameOver', { winner: userId });
+      }
+    });
+
+    socket.on('abandon', ({ gameId, userId }) => {
+      const game = games.get(gameId);
+      if (game && !game.winner) {
+        const winner = game.players.find(p => p !== userId);
+        game.winner = winner;
+        game.abandoned = true;
+        saveResult(pool, game);
+        io.to(gameId).emit('gameOver', { winner, forfeit: true });
       }
     });
 
     socket.on('disconnect', () => {
-      console.log(`Utilisateur déconnecté : ${socket.id}`);
-      for (const [roomId, data] of activeGames.entries()) {
-        data.players = data.players.filter(p => p.id !== socket.id);
-        if (data.players.length === 0) {
-          activeGames.delete(roomId); // on supprime la salle vide
-        }
-      }
+      console.log(`Déconnexion : ${socket.id}`);
     });
   });
+
+  const checkWinner = (board, x, y, playerId) => {
+    const directions = [
+      [1, 0], [0, 1], [1, 1], [1, -1]
+    ];
+    for (let [dx, dy] of directions) {
+      let count = 1;
+      for (let dir of [-1, 1]) {
+        let nx = x, ny = y;
+        while (true) {
+          nx += dx * dir;
+          ny += dy * dir;
+          if (board[nx] && board[nx][ny] === playerId) {
+            count++;
+          } else {
+            break;
+          }
+        }
+      }
+      if (count >= 5) return true;
+    }
+    return false;
+  };
+
+  const saveResult = async (pool, game) => {
+    try {
+      await pool.query(
+        'INSERT INTO games (id, player_x, player_o, winner, moves, abandoned, created_at) VALUES ($1, $2, $3, $4, $5, $6, NOW())',
+        [
+          game.id,
+          game.players[0],
+          game.players[1],
+          game.winner,
+          JSON.stringify(game.moves),
+          game.abandoned
+        ]
+      );
+      console.log('Résultat enregistré.');
+    } catch (err) {
+      console.error('Erreur lors de l’enregistrement en BDD :', err.message);
+    }
+  };
 };
